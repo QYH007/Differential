@@ -5,46 +5,44 @@ import torch.nn.functional as F
 import util
 import math
 import nvdiffrast.torch as dr
-import matplotlib.pyplot as plt
 import time
 
 #-------------------------------------Initial states--------------------------------------
 #-------------- Control -----------
 model_path        = "mesh/objects/"
-model_name        = "bunny.obj"
-scale_factor      = 0.01
-LOD_level         = 3
-SSAO_mode         = False
+model_name        = "bunny.obj"     # "buddha.obj", "buddha2.obj", "cat.obj", "feline.obj", "tiger.obj", "zebra.obj"
+LOD_level         = 4               # from 1 to 7
+SSAO_mode         = False           # toggle 
 texture_mode      = True
 max_mip_level     = 9
 
 #------------- render ------------
 ssao_samples      = 16
-ssao_radius       = 0.1
-ssao_sharpness    = 3.0
+ssao_radius       = 0.05
+ssao_sharpness    = 5.0
 res               = 1024
 ref_res           = 1024
 
 #------------- Iteration -----------
 max_iter          = 1000
-display_interval  = 10
+display_interval  = 1000
 log_interval      = 10
-imgsave_fn        = 'iter_%06d.png'
+imgsave_fn        = 'img_%06d.png'
 imgsave_interval  = 1000
 display_res       = 512
 use_opengl        = True
 enable_mip        = True
 
 #------------- learning rate ---------------
-vtx_pos_lr        = 1e-3
-vtx_uv_lr         = 1e-4
-normal_lr         = 1e-3
-albedo_lr         = 1e-3
+vtx_pos_lr        = [1e-3,  0,      1e-3,   1e-3,   1e-3,   0,      1e-3, 1e-3]
+normal_lr         = [0,     1e-3,   0,      1e-3,   1e-3,   0,      1e-3, 1e-3]
+vtx_uv_lr         = [0,     1e-4,   1e-4,   0,      1e-4,   1e-4,   0   , 1e-4]
+albedo_lr         = [0,     1e-3,   1e-3,   1e-3,   0,      1e-3,   0  ,  1e-3]
 lr_ramp           = 0.1
 
 #-------------- output----------
 out_dir           = f'./opt_result'
-texsave_fn        = f'opt_tex_{LOD_level}.png'
+texsave_fn        = f'tex_{LOD_level}.png'
 
 def render(glctx, mtx, lightdir, campos, d: util.ModelData, resolution, max_mip_level, SSAO_mode, M = None, V = None, P = None):
     # Rasterization
@@ -60,6 +58,7 @@ def render(glctx, mtx, lightdir, campos, d: util.ModelData, resolution, max_mip_
     if(SSAO_mode):
         ao = render_SSAO(d, M, V, P, rast_out, rast_out_db, kernel, ssao_samples, ssao_radius, ssao_sharpness)
         final_color = ao*env_color + lighting_color
+        final_color = ao
     else:
         final_color = env_color + lighting_color
     
@@ -139,6 +138,7 @@ def render_SSAO(d: util.ModelData, M, V, P, rast_out, rast_out_db, kernel, num_s
         .expand(-1, num_samples, -1, -1, -1)      # [B, N, 1, H, W]
         .reshape(B * num_samples, 1, H, W)        # [B*N, 1, H, W]
     )
+
     # construct TBN basis by world normal per pixel
     up = torch.tensor([0, 1, 0], dtype=torch.float32, device=device).view(1, 3, 1, 1)
     T = F.normalize(torch.cross(normal_map, up.expand_as(normal_map)), dim=1)
@@ -167,7 +167,7 @@ def render_SSAO(d: util.ModelData, M, V, P, rast_out, rast_out_db, kernel, num_s
     sample_clip = torch.matmul(sample_positions_homo, vp.t())
 
     # [x,y,z] / w -> NDC
-    sample_ndc = sample_clip[..., :3] / (sample_clip[..., 3:4] + 1e-8)
+    sample_ndc = sample_clip[..., :3] / (sample_clip[..., 3:4] + 1e-8)  # 防止除0
 
     # get sample points' [x, y] NDC position
     offset_grid = sample_ndc[..., :2]  # (B, N, H, W, 2)
@@ -180,8 +180,6 @@ def render_SSAO(d: util.ModelData, M, V, P, rast_out, rast_out_db, kernel, num_s
     position_map_expand = position_map.unsqueeze(1).expand(-1, num_samples, -1, -1, -1)  # (B, N, 3, H, W)
     position_map_expand = position_map_expand.reshape(B * num_samples, 3, H, W)
 
-    # position_map_expand:  torch.Size([16, 3, 1024, 1024])
-    # offset_grid:  torch.Size([16, 1024, 1024, 2])
     sampled_pos = F.grid_sample(position_map_expand, offset_grid, mode='bilinear', align_corners=False)
     sampled_valid = F.grid_sample(valid_mask, offset_grid, mode='bilinear', align_corners=False)
 
@@ -191,10 +189,7 @@ def render_SSAO(d: util.ModelData, M, V, P, rast_out, rast_out_db, kernel, num_s
     ref_pos = position_map.unsqueeze(1).expand(-1, num_samples, -1, -1, -1)  # (B, N, 3, H, W)
 
     # compute SSAO by sigmoid
-    delta = sampled_pos - ref_pos# 1. delta: sample_pos - ref_pos，shape = (B, N, 3, H, W)
-    dist = delta.norm(dim=2)  # (B, N, H, W)
-
-    atten = torch.exp(- (dist ** 2) / (1 ** 2))
+    delta = sampled_pos - ref_pos
 
     normal_map_expand = normal_map.unsqueeze(1).expand(-1, num_samples, -1, -1, -1)  # (B, N, 3, H, W)
  
@@ -202,8 +197,7 @@ def render_SSAO(d: util.ModelData, M, V, P, rast_out, rast_out_db, kernel, num_s
     dp = (delta * normal_map_expand).sum(dim=2)  # (B, N, H, W)
 
     # Soft occlusion
-    occ = 2 * torch.sigmoid((dp - bias) *sharpness) - 1
-    occ = occ * atten
+    occ = torch.sigmoid((dp - bias) *sharpness) - 0.5
 
     valid_count = sampled_valid.squeeze(1)  
     valid_count = valid_count.view(B, num_samples, H, W).sum(dim=1) + 1e-6  # [B, H, W]
@@ -218,128 +212,126 @@ def render_SSAO(d: util.ModelData, M, V, P, rast_out, rast_out_db, kernel, num_s
 # ----------------------- Step.1  prepareing -------------------------
 os.makedirs(out_dir, exist_ok=True)
 
-#-------------------------------------Initial states--------------------------------------
-model_data = util.load_obj(model_path + model_name)  #没问题
-# loading origin model data, and pack into util.ModelData
-low_res_path = util.simplify(model_path + model_name, LOD_level)
-low_model_data = util.load_obj(low_res_path)
+for test in range(len(vtx_pos_lr)):
+    ssim_accumulator = []
+    for avg in range(3):
+        #-------------------------------------Initial states--------------------------------------
+        model_data = util.load_obj(model_path + model_name)
+        # loading origin model data, and pack into util.ModelData
+        low_res_path = util.simplify(model_path + model_name, LOD_level)
+        low_model_data = util.load_obj(low_res_path)
 
-low_model_data.vtx_pos.requires_grad_()
-low_model_data.vtx_uv.requires_grad_()
-low_model_data.normals.requires_grad_()
-low_model_data.albedo = model_data.albedo.clone()
-low_model_data.roughness_var = model_data.roughness_var
-low_model_data.metallic_var = model_data.metallic_var
-    
-glctx = dr.RasterizeGLContext() if use_opengl else dr.RasterizeCudaContext()
-ang = 0.0
+        low_model_data.vtx_pos.requires_grad_()
+        low_model_data.vtx_uv.requires_grad_()
+        low_model_data.normals.requires_grad_()
+        low_model_data.albedo = model_data.albedo.clone()
+        low_model_data.roughness_var = model_data.roughness_var
+        low_model_data.metallic_var = model_data.metallic_var
+            
+        glctx = dr.RasterizeGLContext() if use_opengl else dr.RasterizeCudaContext()
+        ang = 0.0
 
-# Adam optimizer for texture with a learning rate ramp.
-if texture_mode:
-    low_model_data.albedo.requires_grad_()
-    optimizer = torch.optim.Adam([
-        {'params': low_model_data.vtx_pos, 'lr': vtx_pos_lr},  
-        {'params': low_model_data.vtx_uv, 'lr': vtx_uv_lr},  
-        {'params': low_model_data.normals, 'lr': normal_lr},
-        {'params': low_model_data.albedo, 'lr': albedo_lr}    
-    ])
-else:
-    optimizer = torch.optim.Adam([
-        {'params': low_model_data.vtx_pos, 'lr': vtx_pos_lr},  
-        {'params': low_model_data.vtx_uv, 'lr': vtx_uv_lr},  
-        {'params': low_model_data.normals, 'lr': normal_lr} 
-    ])
-scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x: lr_ramp**(float(x)/float(max_iter)))
+        # Adam optimizer for texture with a learning rate ramp.
+        if texture_mode:
+            low_model_data.albedo.requires_grad_()
+            optimizer = torch.optim.Adam([
+                {'params': low_model_data.vtx_pos, 'lr': vtx_pos_lr[test]},  
+                {'params': low_model_data.vtx_uv, 'lr': vtx_uv_lr[test]},  
+                {'params': low_model_data.normals, 'lr': normal_lr[test]},
+                {'params': low_model_data.albedo, 'lr': albedo_lr[test]}    
+            ])
+        else:
+            optimizer = torch.optim.Adam([
+                {'params': low_model_data.vtx_pos, 'lr': vtx_pos_lr[test]},  
+                {'params': low_model_data.vtx_uv, 'lr': vtx_uv_lr[test]},  
+                {'params': low_model_data.normals, 'lr': normal_lr[test]} 
+            ])
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x: lr_ramp**(float(x)/float(max_iter)))
 
-# Render.
-ang = 0.0
-losses = [] 
-loss_avg = []
-SSIMs = []
-kernel = util.sample_hemisphere(ssao_samples, device='cuda')
-kernel = F.normalize(kernel, dim=-1)
-scales = torch.rand(ssao_samples, 1, device='cuda') ** 2  # bias towards center
-kernel = kernel * scales  # now in unit sphere, not unit sphere surface
-for it in range(max_iter + 1):
-    torch.cuda.synchronize()
-    start_time = time.time()
-    # Random rotation/translation matrix for optimization.
-    r_rot = util.random_rotation_translation(0.25)
+        # Render.
+        ang = 0.0
+        losses = [] 
+        loss_avg = []
+        SSIMs = []
+        kernel = util.sample_hemisphere(ssao_samples, device='cuda')
+        kernel = F.normalize(kernel, dim=-1)
+        scales = torch.rand(ssao_samples, 1, device='cuda') ** 2  # bias towards center
+        kernel = kernel * scales  # now in unit sphere, not unit sphere surface
+        for it in range(max_iter + 1):
+            torch.cuda.synchronize()
+            start_time = time.time()
+            # Random rotation/translation matrix for optimization.
+            r_rot = util.random_rotation_translation(0.25)
 
-    # Smooth rotation for display.
-    a_rot = np.matmul(util.rotate_x(-0.4), util.rotate_y(0))
-    dist = np.random.uniform(0.0, 30)
+            # Smooth rotation for display.
+            a_rot = np.matmul(util.rotate_x(-0.4), util.rotate_y(ang))
+            dist = np.random.uniform(0.0, 30)
 
-    P = util.projection(x=0.4, n=1.5, f=100.0).astype(np.float32)
+            P = util.projection(x=0.4, n=1.5, f=100.0).astype(np.float32)
 
-    r_V = util.translate(0, 0, -10 - dist).astype(np.float32)
-    r_M = np.matmul(r_rot, util.scale(scale_factor, scale_factor, scale_factor)).astype(np.float32)
-    r_MV = np.matmul(r_V, r_M).astype(np.float32)
-    r_MVP = np.matmul(P, r_MV).astype(np.float32)
+            r_V = util.translate(0, 0, -10 - dist).astype(np.float32)
+            r_M = np.matmul(r_rot, util.scale(0.01, 0.01, 0.01)).astype(np.float32)
+            r_MV = np.matmul(r_V, r_M).astype(np.float32)
+            r_MVP = np.matmul(P, r_MV).astype(np.float32)
 
-    a_V = util.translate(0, 0, -15).astype(np.float32)
-    a_M = np.matmul(a_rot, util.scale(scale_factor, scale_factor, scale_factor)).astype(np.float32)
-    a_MV = np.matmul(a_V, a_M).astype(np.float32)
-    a_MVP = np.matmul(P, a_MV).astype(np.float32)
+            a_V = util.translate(0, 0, -15).astype(np.float32)
+            a_M = np.matmul(a_rot, util.scale(0.01, 0.01, 0.01)).astype(np.float32)
+            a_MV = np.matmul(a_V, a_M).astype(np.float32)
+            a_MVP = np.matmul(P, a_MV).astype(np.float32)
 
-    # Solve camera positions.
-    a_campos = torch.as_tensor(np.linalg.inv(a_MV)[:3, 3], dtype=torch.float32, device='cuda')
-    r_campos = torch.as_tensor(np.linalg.inv(r_MV)[:3, 3], dtype=torch.float32, device='cuda')
+            # Solve camera positions.
+            a_campos = torch.as_tensor(np.linalg.inv(a_MV)[:3, 3], dtype=torch.float32, device='cuda')
+            r_campos = torch.as_tensor(np.linalg.inv(r_MV)[:3, 3], dtype=torch.float32, device='cuda')
 
-    lightdir = np.asarray([.8, -1., .5, 0.0])
-    lightdir = np.matmul(a_MVP, lightdir)[:3]
-    lightdir /= np.linalg.norm(lightdir)
-    lightdir = torch.as_tensor(lightdir, dtype=torch.float32, device='cuda')
-    
-    # Render reference and optimized frames. Always enable mipmapping for reference.
-    color     = render(glctx, r_MVP, lightdir, r_campos, model_data,     ref_res, max_mip_level, SSAO_mode, M = r_M, V= r_V, P = P)
-    color_opt = render(glctx, r_MVP, lightdir, r_campos, low_model_data, ref_res, max_mip_level, SSAO_mode, M = r_M, V= r_V, P = P)
-    # Reduce the reference to correct size.
-    while color.shape[1] > res:
-        color = util.bilinear_downsample(color)
+            lightdir = np.asarray([.8, -1., .5, 0.0])
+            lightdir = np.matmul(a_MVP, lightdir)[:3]
+            lightdir /= np.linalg.norm(lightdir)
+            lightdir = torch.as_tensor(lightdir, dtype=torch.float32, device='cuda')
+            
+            # Render reference and optimized frames. Always enable mipmapping for reference.
+            color     = render(glctx, r_MVP, lightdir, r_campos, model_data,     ref_res, max_mip_level, SSAO_mode, M = r_M, V= r_V, P = P)
+            color_opt = render(glctx, r_MVP, lightdir, r_campos, low_model_data, ref_res, max_mip_level, SSAO_mode, M = r_M, V= r_V, P = P)
+            # Reduce the reference to correct size.
+            while color.shape[1] > res:
+                color = util.bilinear_downsample(color)
 
-    # Compute loss and perform a training step.
-    L2 = torch.mean((color - color_opt)**2) # L2 pixel loss.
-    ssim_map = util.calculate_ssim_color(color, color_opt)
-    loss =  torch.mean(1.0 - ssim_map)
-    losses.append(float(loss))
+            # Compute loss and perform a training step.
+            L2 = torch.mean((color - color_opt)**2) # L2 pixel loss.
+            ssim_map = util.calculate_ssim_color(color, color_opt)
+            loss =  torch.mean(1.0 - ssim_map)
+            losses.append(float(loss))
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    scheduler.step()
-    
-    # initail snapshots
-    if it == 0:
-        origin_img = render(glctx, a_MVP, lightdir, a_campos, model_data, ref_res, max_mip_level, SSAO_mode, M = a_M, V= a_V, P = P)[0].cpu().numpy()[::-1]
-        util.save_image(out_dir + '/origin_resolution.png', origin_img)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-    # Print/save log.
-    if log_interval and (it % log_interval == 0):
-        color_opt = render(glctx, a_MVP, lightdir, a_campos, low_model_data, ref_res, max_mip_level, SSAO_mode,  M = a_M, V= a_V, P = P)
-        color = render(glctx, a_MVP, lightdir, a_campos, model_data, ref_res, max_mip_level, SSAO_mode,  M = a_M, V= a_V, P = P)
-        ssim = util.calculate_ssim_color(color, color_opt).mean().item()
-        SSIMs.append(ssim) # ssim
-        s = "iter=%d, loss=%f, SSIM=%f, " % (it, loss, ssim)
-        print(s)
+            # Print/save log.
+            if log_interval and (it % log_interval == 0):
+                color_opt = render(glctx, a_MVP, lightdir, a_campos, low_model_data, ref_res, max_mip_level, SSAO_mode,  M = a_M, V= a_V, P = P)
+                color = render(glctx, a_MVP, lightdir, a_campos, model_data, ref_res, max_mip_level, SSAO_mode,  M = a_M, V= a_V, P = P)
+                ssim = util.calculate_ssim_color(color, color_opt).mean().item()
+                SSIMs.append(ssim) # ssim
+                s = "iter=%d, loss=%f, SSIM=%f, " % (it, loss, ssim)
+                print(s)
 
-    # Show/save image.
-    display_image = display_interval and (it % display_interval == 0)
-    save_image = imgsave_interval and (it % imgsave_interval == 0)
+            # Show/save image.
+            display_image = display_interval and (it % display_interval == 0)
 
-    if display_image or save_image:
-        with torch.no_grad():
-            result_image = color_opt = render(glctx, a_MVP, lightdir, a_campos, low_model_data, ref_res, max_mip_level, SSAO_mode,  M = a_M, V= a_V, P = P)[0].cpu().numpy()[::-1]
             if display_image:
-                util.display_image(result_image, size=display_res, title='%d / %d' % (it, max_iter))
-            if save_image:
-                util.save_image(out_dir + '/' + (imgsave_fn % it), result_image)
-    
-    if it == max_iter:
-        with torch.no_grad():
-            if texture_mode:
-                texture = low_model_data.albedo.cpu().numpy()[::-1]
-                util.save_image(out_dir + '/' + texsave_fn, texture)
+                with torch.no_grad():
+                    result_image = color_opt = render(glctx, a_MVP, lightdir, a_campos, low_model_data, ref_res, max_mip_level, SSAO_mode,  M = a_M, V= a_V, P = P)[0].cpu().numpy()[::-1]
+                    if display_image:
+                        util.display_image(result_image, size=display_res, title='%d / %d' % (it, max_iter))
 
-# Done.
-util.export_to_obj(low_model_data,  f"opt_result/optimized_{LOD_level}_{model_name}")
+        # Done.
+        if avg == 0:
+            ssim_accumulator = [0.0] * len(SSIMs)
+        for i in range(len(SSIMs)):
+            ssim_accumulator[i] += SSIMs[i]
+        # plot_loss_curve(SSIMs)
+    ssim_accumulator = [x / 3.0 for x in ssim_accumulator]
+    log_path = "./LT_logs/"
+    txt_filename =  log_path + "B"+str(test+1) +".txt"
+    util.save_txt(ssim_accumulator, txt_filename)
+#----------------------------------------------------------------------------
